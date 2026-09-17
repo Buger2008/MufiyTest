@@ -223,7 +223,10 @@ jobs:
 
           # 架构必须对：跑错架构的 runner 会静默产出另一种架构的二进制
           ARCHS="$(lipo -archs "$BIN")"
-          echo "lipo -archs = $ARCHS（期望包含 $EXPECT_ARCH）"
+          # ⚠ 变量展开后面紧跟中文标点时**必须**写 ${VAR}：写成 `$ARCHS（…）` 时，
+          #   那半个全角括号的字节会被当成变量名的一部分，在 `set -u` 下直接报
+          #   `ARCHS<乱码>: unbound variable`。同类的 `$VAR 中文` 也要留意（有空格才安全）。
+          echo "lipo -archs = ${ARCHS}（期望包含 ${EXPECT_ARCH}）"
           case "$ARCHS" in
             *"$EXPECT_ARCH"*) ;;
             *) echo "::error::产物架构不符：$ARCHS"; exit 1 ;;
@@ -282,6 +285,10 @@ jobs:
             图形后端固定为软件光栅（CPU），不依赖 Metal / OpenGL。
             启动日志在可执行文件同目录的 startup-diagnostic.log，每次启动覆盖写入，
             起不来的时候先看它。
+
+            若是启动时报 "Library not loaded: libSkiaSharp.dylib" 这类"找不到同目录的库"，
+            说明运行时没走程序目录探测，临时用这一行跑（不必重新打包）：
+              DYLD_LIBRARY_PATH=. ./MufiyApp1
           TXT
 
           chmod +x "$STAGE/MufiyApp1"
