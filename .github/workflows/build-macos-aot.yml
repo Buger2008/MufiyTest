@@ -1,0 +1,387 @@
+# =============================================================================
+# macOS NativeAOT 构建 + 自动发布
+#
+# 触发方式：仓库页面 → Actions → 左侧选 "Build macOS (NativeAOT)" → Run workflow。
+# 一次跑出两种架构的原生单文件程序，各自连同上目录下的全部原生依赖打成 tar.gz，
+# 最后由 release job 汇总成一个 GitHub Release 自动发布（附 SHA256 校验和）。
+#
+# 【为什么用两条 runner，而不是一条 runner 交叉编译】
+#   NativeAOT 不支持跨架构 / 跨 OS 交叉编译 —— 要产出什么架构的 Mach-O，
+#   就得在什么架构的机器上调用链接器。所以：
+#     · arm64（Apple 芯片）→ macos-15        （Apple Silicon，M1，3C/7G）
+#     · x64  （Intel）      → macos-15-intel  （Intel，4C/14G）
+#   ⚠ 不要用 macos-13：该镜像已于 2025-12-04 完全退役，写上去会直接失败。
+#     macos-latest / macos-14 / macos-15 / macos-26 都是 Apple Silicon；
+#     只有 macos-15-intel / macos-26-intel 是 Intel。
+#
+# 【Xcode 与前置组件】
+#   runner 自带完整 Xcode，NativeAOT 在 macOS 上用的就是它的 clang / ld / dsymutil，
+#   不需要额外安装任何东西（下面"前置检查"会先把这几个命令验证一遍）。
+#   另：.NET 10 的 ILCompiler 只在检测到 Xcode 15 时才追加 -ld_classic
+#   （见 Microsoft.NETCore.Native.Unix.targets），Xcode 16/26 上不涉及，
+#   所以 macos-15 / macos-26 都不会踩这个坑。
+#   真要绕开这个探测，加 -p:UseLdClassicXCodeLinker=false 即可。
+#
+# 【产物形态】
+#   NativeAOT 单文件原生可执行程序（无托管 DLL、无 .NET 运行时依赖），
+#   但它 P/Invoke 的 libSkiaSharp.dylib / libHarfBuzzSharp.dylib / libSDL3.dylib
+#   仍然是独立文件，必须在同一个目录里 —— 所以打包时整个 publish 目录一起进 tar。
+# =============================================================================
+
+name: Build macOS (NativeAOT)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布用的 tag（留空 = 自动用 v0.0.<run_number>）'
+        required: false
+        default: ''
+      prerelease:
+        description: '发布为 Pre-release'
+        type: boolean
+        default: false
+      keep_symbols:
+        description: '把 dSYM 调试符号也打进 tar（默认不打，带上包会大很多）'
+        type: boolean
+        default: false
+
+# 默认只读；创建 Release 的写权限只给 release job
+permissions:
+  contents: read
+
+# 同一分支上不并发跑两次，避免两个 run 同时往同一个 tag 传资产
+concurrency:
+  group: macos-aot-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+  PROJECT: MufiyApp1/MufiyApp1.csproj
+  # 目标框架写死 net10.0：csproj 里 Release 只保留这一个（Debug 才多一个 -windows），
+  # 而且 Mufiy 包本身也只发 lib/net10.0，net10.0 才是它的原生目标框架。
+  TFM: net10.0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 版本号只在这里算一次，build / release 都从这里取，避免两处逻辑跑偏
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: 解析版本号
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: 计算 tag
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="v0.0.${GITHUB_RUN_NUMBER}"
+          fi
+          # 限制字符集：tag 会被拼进文件名和 gh release 参数，别让奇怪字符混进去
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$'; then
+            echo "::error::tag 不合法（只允许字母数字和 . _ -）: $TAG"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次 tag = $TAG"
+
+  # ---------------------------------------------------------------------------
+  # 两个架构各跑一条 runner，互不阻塞（fail-fast: false 便于一次看清两边的问题）
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.arch }} (${{ matrix.rid }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arch 用于包名（macos-arm64 / macos-x64）
+          # binary_arch 是 lipo 报告的实际架构名（x64 在 Mach-O 里叫 x86_64）
+          - rid: osx-arm64
+            arch: arm64
+            binary_arch: arm64
+            runner: macos-15
+          - rid: osx-x64
+            arch: x64
+            binary_arch: x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # NuGet 全局包目录缓存：AOT 要下 ILCompiler + 各架构的 runtime pack，几百 MB。
+      # 注意 key 里带 runner.arch —— arm64 与 x64 的包不通用，必须分开缓存。
+      - uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('nuget.config', 'MufiyApp1/MufiyApp1.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-${{ runner.arch }}-
+
+      # 先把环境摊开看一眼。NativeAOT 在 macOS 上缺 Xcode 组件时，
+      # 报错位置离真正原因很远，不如在这里先卡住。
+      - name: 前置检查（Xcode / SDK / .NET）
+        run: |
+          set -euo pipefail
+          echo "runner image = ${ImageOS:-?}"
+          echo "--- xcode-select -p ---"
+          xcode-select -p
+          echo "--- xcodebuild -version ---"
+          xcodebuild -version
+          echo "--- macOS SDK ---"
+          xcrun --sdk macosx --show-sdk-path
+          echo "--- clang / ld / dsymutil ---"
+          # 这三个缺一不可：NativeAOT 在 macOS 上就是用它们链接和抽符号的。
+          for t in clang ld dsymutil; do
+            command -v "$t" || { echo "::error::PATH 里找不到 $t"; exit 1; }
+          done
+          echo "--- dotnet ---"
+          dotnet --version
+          dotnet --list-runtimes
+
+      - name: 还原依赖
+        run: dotnet restore "$PROJECT" -r ${{ matrix.rid }}
+
+      - name: NativeAOT 发布
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+          PUBLISH_DIR="$RUNNER_TEMP/publish-$RID"
+          rm -rf "$PUBLISH_DIR"
+          # 后面几步（rpath 检查、打包）都要用，写进 GITHUB_ENV 传给后续 step
+          echo "PUBLISH_DIR=$PUBLISH_DIR" >> "$GITHUB_ENV"
+
+          dotnet publish "$PROJECT" \
+            -c Release \
+            -f "$TFM" \
+            -r "$RID" \
+            -p:PublishAot=true \
+            -o "$PUBLISH_DIR"
+
+          echo "=== publish 目录 ==="
+          ls -la "$PUBLISH_DIR"
+
+      - name: 校验原生产物并兜底 rpath
+        env:
+          EXPECT_ARCH: ${{ matrix.binary_arch }}
+        run: |
+          set -euo pipefail
+          BIN="$PUBLISH_DIR/MufiyApp1"
+
+          echo "--- file ---"
+          file "$BIN"
+
+          echo "--- otool -L（运行时依赖）---"
+          otool -L "$BIN"
+
+          # rpath 正常由 csproj 里的 ExtraLinkerArg 加上（见 MufiyApp1.csproj 末尾注释）。
+          # 这里只做兜底：万一哪天 SDK 改了行为没加上，现场补一条并重新临时签名 ——
+          # 改过 Mach-O 之后原签名必然失效，而 arm64 上签名无效的进程会被内核直接杀掉。
+          #
+          # ⚠ 不要写成 `otool -l "$BIN" | grep -q ...`：grep -q 一命中就退出会让 otool 吃到
+          # SIGPIPE，在 `set -o pipefail` 下整条管道反而算失败，判断结果会反。
+          LC_RPATH_DUMP="$(otool -l "$BIN" | grep -A2 'LC_RPATH' || true)"
+          echo "--- 当前 LC_RPATH ---"
+          printf '%s\n' "${LC_RPATH_DUMP:-(无)}"
+
+          case "$LC_RPATH_DUMP" in
+            *'path @executable_path'*)
+              echo "已带 @executable_path rpath ✔"
+              ;;
+            *)
+              echo "::warning::未发现 @executable_path rpath，现场补一条并重新临时签名"
+              install_name_tool -add_rpath @executable_path "$BIN"
+              codesign --force --sign - "$BIN"
+              ;;
+          esac
+
+          # 架构必须对：跑错架构的 runner 会静默产出另一种架构的二进制
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "lipo -archs = $ARCHS（期望包含 $EXPECT_ARCH）"
+          case "$ARCHS" in
+            *"$EXPECT_ARCH"*) ;;
+            *) echo "::error::产物架构不符：$ARCHS"; exit 1 ;;
+          esac
+
+      - name: 打包 tar.gz
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          KEEP_SYMBOLS: ${{ inputs.keep_symbols }}
+        run: |
+          set -euo pipefail
+          PKG="MufiyApp1-${VERSION}-macos-${ARCH}"
+          STAGE_ROOT="$RUNNER_TEMP/stage"
+          STAGE="$STAGE_ROOT/$PKG"
+          rm -rf "$STAGE_ROOT"
+          mkdir -p "$STAGE"
+
+          # 整个 publish 目录一起搬：可执行文件 + libSkiaSharp/libHarfBuzzSharp/libSDL3
+          # + Assets/Fonts 下的字体。它们必须同目录，分开装会起不来。
+          cp -R "$PUBLISH_DIR/." "$STAGE/"
+
+          if [ "$KEEP_SYMBOLS" != "true" ]; then
+            # dSYM 是调试符号，运行完全用不到，却能让包大好几倍；需要时勾 keep_symbols
+            find "$STAGE" -maxdepth 1 \( -name '*.dSYM' -o -name '*.pdb' \) -exec rm -rf {} +
+          fi
+
+          cat > "$STAGE/README-macos.txt" <<'TXT'
+          MufiyApp1 — macOS 原生构建（NativeAOT）
+          =======================================
+
+          目录内容
+            MufiyApp1               原生可执行文件（无 .NET 运行时依赖）
+            libSkiaSharp.dylib      图形渲染
+            libHarfBuzzSharp.dylib  文字排版
+            libSDL3.dylib           窗口与输入
+            Assets/Fonts/*.ttf      随程序带出的字体资源
+            上面这些库必须和 MufiyApp1 待在同一个目录，不要单独挪走。
+
+          运行
+            在终端里 cd 到本目录，然后：
+              ./MufiyApp1
+
+          第一次运行被 macOS 拦住（"无法验证开发者" / "已损坏，无法打开"）
+            本包没有做 Apple 开发者签名与公证，从浏览器下载后会被 Gatekeeper 打上隔离标记。
+            任选一种处理：
+              xattr -dr com.apple.quarantine ./            # 去掉隔离标记（推荐）
+              系统设置 → 隐私与安全性 → 仍要打开
+              右键图标 → 打开
+
+          系统要求
+            macOS 12.0 或更高（.NET 10 的下限，构建时 target triple 用的是 macos12.0）
+            Apple 芯片用 macos-arm64 包，Intel 芯片用 macos-x64 包，两者不能互换。
+
+          排查
+            图形后端固定为软件光栅（CPU），不依赖 Metal / OpenGL。
+            启动日志在可执行文件同目录的 startup-diagnostic.log，每次启动覆盖写入，
+            起不来的时候先看它。
+          TXT
+
+          chmod +x "$STAGE/MufiyApp1"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+
+          # COPYFILE_DISABLE + --no-mac-metadata：别把 ._xxx 这类 AppleDouble 垃圾塞进 tar
+          COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$GITHUB_WORKSPACE/dist/$PKG.tar.gz" \
+            -C "$STAGE_ROOT" "$PKG"
+
+          echo "=== 包内容清单 ==="
+          tar -tzf "$GITHUB_WORKSPACE/dist/$PKG.tar.gz"
+          echo "=== 产物 ==="
+          ls -lh "$GITHUB_WORKSPACE/dist"
+          shasum -a 256 "$GITHUB_WORKSPACE/dist/$PKG.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 汇总发布。放在 ubuntu-latest 上：gh CLI 和 sha256sum 都是现成的。
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布 Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 收集两个架构的产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 计算校验和
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -lh
+          sha256sum -- *.tar.gz | tee SHA256SUMS.txt
+
+      - name: 生成 Release 说明
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/notes.tpl" <<'TPL'
+          MufiyApp1 的 macOS 原生构建（NativeAOT，不依赖 .NET 运行时），版本 @VERSION@。
+
+          | 包 | 适用机器 |
+          | --- | --- |
+          | `MufiyApp1-@VERSION@-macos-arm64.tar.gz` | Apple 芯片（M 系列） |
+          | `MufiyApp1-@VERSION@-macos-x64.tar.gz` | Intel 芯片 |
+
+          解压后 cd 进同名目录，终端里执行 `./MufiyApp1`。
+          可执行文件所需的 `libSkiaSharp.dylib` / `libHarfBuzzSharp.dylib` / `libSDL3.dylib`
+          都在同一个目录里，不要单独挪动；详情见包内 `README-macos.txt`。
+
+          **首次运行前请先去掉隔离标记**（本包未做 Apple 签名与公证）：
+
+          ```
+          xattr -dr com.apple.quarantine ./
+          ```
+
+          系统要求：macOS 12.0 或更高。
+          TPL
+          sed -e "s|@VERSION@|${VERSION}|g" -e "s|@TAG@|${TAG}|g" \
+            "$RUNNER_TEMP/notes.tpl" > "$RUNNER_TEMP/notes.md"
+          {
+            echo ''
+            echo '### SHA256'
+            echo ''
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          EXTRA=()
+          if [ "$PRERELEASE" = "true" ]; then
+            EXTRA+=(--prerelease)
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 同名 Release 已存在（比如重跑一次）：覆盖资产，不重建
+            echo "Release $TAG 已存在，覆盖上传资产"
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            echo "创建 Release $TAG"
+            # --target 在 tag 已存在时会被忽略，所以这里可以无脑带上
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "${EXTRA[@]}"
+          fi
+
+          echo "=== 结果 ==="
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"

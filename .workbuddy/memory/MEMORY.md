@@ -41,6 +41,15 @@
   （多目标必须 `-f`；**不能**在 Linux 上交叉产出 Windows exe，NativeAOT 不支持跨 OS）。
   先决条件 Ubuntu 系 `clang zlib1g-dev`；产物注意 glibc 下限（在 20.04 上构建只能跑 20.04+）。
   win-x86 的 shim 是 RID 条件 + `OperatingSystem.IsWindows()` 判断，Linux 上自动不参与。
+- **macOS 构建 + 自动发布**（2026-09-17 建立）：`.github/workflows/build-macos-aot.yml`，
+  手动触发，跑出 `MufiyApp1-<ver>-macos-{arm64,x64}.tar.gz` 并自动挂到 GitHub Release。
+  要点：**NativeAOT 不能交叉编译**，arm64 用 `macos-15`、x64 用 `macos-15-intel`
+  （`macos-13` 已退役，其余 macOS 标签都是 arm64）；
+  主可执行文件**必须自己补 `@executable_path` rpath**（csproj 里的 `ExtraLinkerArg`，
+  仅 OSX+PublishAot 生效），否则 `dyld: Library not loaded: @rpath/libSkiaSharp.dylib`；
+  发布包排除 `.dSYM`/`.pdb`（本机 win 产物里 `MufiyApp1.pdb` 就有 28 MB）；
+  改了 Mach-O 之后必须 `codesign --force --sign -` 重签，否则 arm64 上会被内核杀掉。
+  产物要求 macOS 12+（ILCompiler 的 `AppleMinOSVersion` 默认 12.0）。
 - **包版本必须四个统一**：`Mufiy` 曾钉 Beta8、其余写 `*-Beta*` 浮动；包源发布 Beta9 后
   清缓存还原会 NU1605 包降级、编不过。现已全部钉 `0.0.1-Beta8`。升版本四个一起升。
 - **踩坑备忘**：这类反射型 + 混淆发布包的框架，AOT 的 root 必须**按类型精确**（rd.xml），

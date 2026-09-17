@@ -175,6 +175,33 @@
 	</ItemGroup>
 
 	<!-- ============================================================================
+	     macOS 专用：给主可执行文件补 @executable_path rpath（只在 macOS 上 AOT 发布时生效）
+
+	     【不补会怎样】
+	     AOT 产物本身是自包含的，但它 P/Invoke 的 libSkiaSharp.dylib /
+	     libHarfBuzzSharp.dylib / libSDL3.dylib 仍是紧挨着 exe 的独立 dylib，
+	     而这三者的 install_name 都是 @rpath/xxx.dylib。
+	     NativeAOT 的链接步骤**只给"聚合可执行文件 shim"加 rpath**，主可执行文件不加
+	     （见 Microsoft.NETCore.Native.Unix.targets：`-Wl,-rpath,@executable_path` 那条
+	     带 _AggregateExecutableShimCompilerAndLinkerArg 前缀）。没有 rpath 时 dyld 找不到
+	     @rpath，运行即：
+	         dyld: Library not loaded: @rpath/libSkiaSharp.dylib
+	     本节显式补一条 @executable_path，让它们从"exe 所在目录"解析。
+
+	     【为什么用 ExtraLinkerArg】
+	     SDK 会把它自动包成 -Wl,<值>，是留给使用者的扩展点（ILCompiler 10.x 起有）。
+	     Windows 构建走不到这里（IsOSPlatform('OSX') 为 false），win-x86 的 shim 也不受影响。
+
+	     注：Linux 同理需要 rpath（$ORIGIN），当前只按需求处理 macOS；要加 Linux 时
+	     在这里再补一个条件即可，写法是 -rpath,'$ORIGIN'。
+
+	     与 win-x86 的 shim 一样，这属于给上游/SDK 兜底的补丁，不需要时整块删掉。
+	     ============================================================================ -->
+	<ItemGroup Condition="'$(PublishAot)' == 'true' and $([MSBuild]::IsOSPlatform('OSX'))">
+		<ExtraLinkerArg Include="-rpath,@executable_path" />
+	</ItemGroup>
+
+	<!-- ============================================================================
 	     win-x86 专用：user32 入口点补丁（只在 32 位目标下带出去）
 
 	     Mufiy 窗口层 P/Invoke 了只存在于 64 位 user32.dll 的 SetWindowLongPtr，
