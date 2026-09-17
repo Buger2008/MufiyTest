@@ -155,8 +155,17 @@ jobs:
           dotnet --version
           dotnet --list-runtimes
 
+      # ⚠ 必须显式带 -p:Configuration=Release，不能只写 `dotnet restore`：
+      #   csproj 的 TargetFrameworks 是按 Configuration 分档的 —— Release 只有 net10.0，
+      #   Debug 会额外挂一个 net10.0-windows（专供 VS 设计器加载，Windows 独有）。
+      #   `dotnet restore` 没有 -c 参数、默认按 Debug 求值，于是在 macOS 上会去还原
+      #   net10.0-windows 目标并直接报：
+      #       error NETSDK1100: To build a project targeting Windows on this operating
+      #       system, set the EnableWindowsTargeting property to true.
+      #   这里要的是给 macOS 出包，用不着也不该拉 Windows 桌面定向包，所以对齐 Release，
+      #   顺带让 obj/project.assets.json 里只留 net10.0(<rid>) 一个目标。
       - name: 还原依赖
-        run: dotnet restore "$PROJECT" -r ${{ matrix.rid }}
+        run: dotnet restore "$PROJECT" -p:Configuration=Release -r ${{ matrix.rid }}
 
       - name: NativeAOT 发布
         env:
