@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+	AotRoots.xml —— NativeAOT / 裁剪形态下的反射根描述（rd.xml）
+
+	【这份文件解决什么】
+	Mufiy 的主题系统在运行期用反射创建「颜色表」对象：
+	    Mufiy.DefaultTheme / Mufiy.Win10Theme
+	      → Mufiy.MufiyThemeColorTable / Mufiy.Win10ThemeColorTable 的各个属性
+	      → Activator.CreateInstance(属性的类型)
+	颜色表的属性类型就是下面这批 *ColorSet 与 WindowDecorationColors（共 37 个）。
+
+	PublishAot 隐含 TrimMode=full，裁剪器看不到「Type → 构造函数」这条边，
+	会把它们的公有无参构造函数剪掉，运行时直接抛：
+
+	    System.MissingMethodException: No parameterless constructor defined
+	    for type 'Mufiy.WindowDecorationColors'.
+	       at System.ActivatorImplementation.CreateInstance(Type, Boolean)
+	       at Mufiy.DefaultTheme..ctor(MufiyAppConfig)
+
+	【为什么不用 TrimmerRootAssembly】
+	@(TrimmerRootAssembly) 会把整个 Mufiy.dll 全量保留，规模大得多：
+	实测它会牵出一批原本不在图里的泛型「编译器生成类型」（状态机 / 闭包类），
+	而 Mufiy 的发布包经过混淆，其中至少一个方法体的元数据 token 是坏的
+	（ILC 报 The format of a DLL or executable being loaded is invalid），
+	于是 ILC 在 CompilerGeneratedState 里硬崩：
+	    Internal.TypeSystem.TypeSystemException+BadImageFormatException
+	      at Internal.TypeSystem.Ecma.EcmaModule.EcmaObjectLookupHashtable.CreateValueFromKey(EntityHandle)
+	      at ILCompiler.Dataflow.CompilerGeneratedState.TypeCache..ctor(...)
+	即 root 整程序集反而发不出包。按类型精确 root 可以绕开这批类型。
+
+	【preserve="all" 的含义】
+	= Dynamic="Required All"：保留该类型全部成员，并为它们生成反射元数据
+	  （含可用于 Activator.CreateInstance 的无参构造函数）。
+
+	【改了这里要重测】
+	新增/升级 Mufiy 包后若颜色表属性类型变多，需同步补到这里；
+	漏掉的类型会在运行时报上面那条 MissingMethodException。
+-->
+<linker>
+	<assembly fullname="Mufiy">
+		<!-- 主题颜色表里所有 *ColorSet 属性类型 -->
+		<type fullname="Mufiy.*ColorSet" preserve="all" />
+		<!-- 窗口装饰颜色（不属于 *ColorSet 命名，需单独列出） -->
+		<type fullname="Mufiy.WindowDecorationColors" preserve="all" />
+		<!-- 颜色表自身：属性是反射遍历的对象 -->
+		<type fullname="Mufiy.*ThemeColorTable" preserve="all" />
+		<type fullname="Mufiy.IThemeColorTable" preserve="all" />
+	</assembly>
+</linker>

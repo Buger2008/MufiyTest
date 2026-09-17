@@ -1,0 +1,77 @@
+; ============================================================================
+; user32.x86.def —— 32 位 user32 入口点补丁（Mufiy win-x86 兼容层）
+;
+; 【为什么需要】
+; Mufiy.Platform.Desktop.Provider 的窗口层声明了 P/Invoke：
+;     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+;     SetWindowLongPtr / GetWindowLongPtr
+; 这两个导出**只存在于 64 位 user32.dll**（实测导出表）：
+;     System32\user32.dll  → SetWindowLongA/W + SetWindowLongPtrA/W
+;     SysWOW64\user32.dll  → 只有 SetWindowLongA/W
+; 于是 32 位进程里 Mufiy.Window..ctor() 一调用就 EntryPointNotFoundException。
+; 注意 CharSet=Unicode 且未设 ExactSpelling，运行时先探测 SetWindowLongPtrW、再探测
+; SetWindowLongPtr，两个在 32 位都不存在。
+;
+; 【怎么绕】
+; 本文件生成一个纯转发 DLL（无代码，只有导出转发表）。32 位进程里用
+; NativeLibrary.SetDllImportResolver 把该程序集对 "user32.dll" 的解析重定向到它：
+;   1. 转发 DLL 必须**补齐 Mufiy 用到的全部 15 个 user32 入口点**，
+;      否则重定向后其它 API 反而找不到；
+;   2. 非 Ptr 的 13 个一律 1:1 转发到同名真实导出（含 A/W 变体），
+;      这样运行时的「探测 W→A→裸名」顺序与真实 user32 完全一致，行为零差异；
+;   3. Ptr 的那两组在 32 位上语义等价于非 Ptr 版本（32 位 LONG 就是指针宽度），
+;      所以 SetWindowLongPtr* → SetWindowLongW/A，GetWindowLongPtr* → GetWindowLongW/A。
+;
+; 【重新生成】
+;   link.exe /dll /noentry /machine:x86 /def:user32.x86.def /out:mufiy.user32.x86.dll
+;   （link.exe 取 VS 的 Hostx64\x86\ 那一份）
+; Mufiy 上游修好「32 位走非 Ptr 分支」之后，本文件与整个补丁都可以删掉。
+; ============================================================================
+
+LIBRARY mufiy.user32.x86
+
+EXPORTS
+    ; ---- 32 位缺失的两组：映射到非 Ptr 版本（这是整个补丁的核心）----
+    SetWindowLongPtrW=user32.SetWindowLongW
+    SetWindowLongPtrA=user32.SetWindowLongA
+    SetWindowLongPtr=user32.SetWindowLongW
+    GetWindowLongPtrW=user32.GetWindowLongW
+    GetWindowLongPtrA=user32.GetWindowLongA
+    GetWindowLongPtr=user32.GetWindowLongW
+
+    ; ---- 以下 1:1 转发，保证重定向后其余 user32 调用行为不变 ----
+    CallWindowProcA=user32.CallWindowProcA
+    CallWindowProcW=user32.CallWindowProcW
+    CallWindowProc=user32.CallWindowProcW
+
+    GetAsyncKeyState=user32.GetAsyncKeyState
+
+    GetCursorPos=user32.GetCursorPos
+
+    GetDC=user32.GetDC
+
+    GetWindowLongA=user32.GetWindowLongA
+    GetWindowLongW=user32.GetWindowLongW
+    GetWindowLong=user32.GetWindowLongW
+
+    PostMessageA=user32.PostMessageA
+    PostMessageW=user32.PostMessageW
+    PostMessage=user32.PostMessageW
+
+    ReleaseDC=user32.ReleaseDC
+
+    ScreenToClient=user32.ScreenToClient
+
+    SendMessageA=user32.SendMessageA
+    SendMessageW=user32.SendMessageW
+    SendMessage=user32.SendMessageW
+
+    SetLayeredWindowAttributes=user32.SetLayeredWindowAttributes
+
+    SetWindowLongA=user32.SetWindowLongA
+    SetWindowLongW=user32.SetWindowLongW
+    SetWindowLong=user32.SetWindowLongW
+
+    SetWindowPos=user32.SetWindowPos
+
+    UpdateLayeredWindow=user32.UpdateLayeredWindow

@@ -1,0 +1,214 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+	</PropertyGroup>
+
+	<!-- 目标框架由「新建项目」向导选择后写入：net11.0 是模板占位符，
+	     展开时被替换为所选框架（如 net10.0），取值规则见 MufiyProjectTemplate.vstemplate 的 WizardData。
+	     Release 只保留所选框架；Debug 额外加一个 -windows 目标，专供 VS 设计器加载
+	     （运行时仍只在无后缀的目标框架上运行，与仓库其它工程一致）。
+
+	     【为什么这里从 net11.0 改成 net10.0 —— 为 Windows 7 兼容性（2026-09-17 实测）】
+	     .NET 11 (RC1) 的 NativeAOT 运行时会**静态导入** `api-ms-win-core-synch-l1-2-0.dll`
+	     的 WaitOnAddress / WakeByAddressSingle（Windows 8 才引入）。静态导入是加载期全量解析，
+	     Win7 上缺这个 api-set 就直接起不来。.NET 10 的 AOT 运行时**没有**这个导入。
+	     隔离实验（同一份空程序，只换 TFM）：net10.0 → 导入表干净；net11.0 → 带 WaitOnAddress；
+	     加不加 OptimizationPreference / InvariantGlobalization 等开关都不影响该导入，纯 TFM 差异。
+
+	     另一层理由：Mufiy 包本身只发 `lib/net10.0`，net10.0 才是它的原生目标框架，
+	     原先写 net11.0 属于"高配运行"，改回 net10.0 是同版本对齐，不是降级将就。 -->
+	<PropertyGroup Condition="'$(Configuration)'=='Release'">
+		<TargetFrameworks>net10.0</TargetFrameworks>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)'=='Debug'">
+		<TargetFrameworks>net10.0-windows;net10.0</TargetFrameworks>
+	</PropertyGroup>
+
+	<!-- ============================================================================
+	     Win7 兼容相关开关（对所有形态生效，保证 Debug 与发布行为一致）
+
+	     InvariantGlobalization：.NET 5+ 在 Windows 上默认用 ICU（icu.dll，Win10 1703+ 才自带）。
+	     Win7 上没有 icu.dll，全球化初始化会失败 —— 必须走 Invariant 模式绕开。
+	     代价：排序/大小写等文化相关行为退化为不变文化；中文显示不受影响。
+
+	     EventSourceSupport / MetadataUpdaterSupport：纯瘦身，与 Win7 无关。
+	     ============================================================================ -->
+	<PropertyGroup>
+		<InvariantGlobalization>true</InvariantGlobalization>
+		<EventSourceSupport>false</EventSourceSupport>
+		<MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="$(TargetFramework.EndsWith('-windows')) == true">
+		<UseWindowsForms>true</UseWindowsForms>
+		<DefineConstants>$(DefineConstants);CLASS_WINFORM</DefineConstants>
+	</PropertyGroup>
+
+	<!-- Mufiy 组件以 NuGet 包方式引用：需要先把 Mufiy 的包源加入 NuGet 源。
+
+	     原写法是 Mufiy 钉死 0.0.1-Beta8、其余写 *-Beta* 浮动（含预发布，「始终解析最高版本」）。
+	     但包源现已发布 0.0.1-Beta9，浮动项全部解析到 Beta9，而 Mufiy 被钉在 Beta8，
+	     于是 Provider Beta9 依赖 Mufiy >= Beta9 → **NU1605 包降级错误，干净还原直接编不过**
+	     （本机之前能编是因为 NuGet 的 v3 http 缓存里还是旧索引，清缓存即复现）。
+
+	     因此这里把四个包统一钉到同一版本。要升 Beta9 必须**四个一起升**，
+	     不要只改 Mufiy 或只让部分包浮动——浮动 + 钉死混用迟早再撞 NU1605。
+	     实测结论：Beta9 同样有 32 位 SetWindowLongPtr 缺陷，升级解决不了 win-x86 问题。 -->
+	<ItemGroup>
+		<PackageReference Include="Mufiy" Version="0.0.1-Beta8" />
+		<PackageReference Include="Mufiy.Platform.Desktop.Provider" Version="0.0.1-Beta8" />
+		<PackageReference Include="Mufiy.Xaml.SourceGenerator" Version="0.0.1-Beta8">
+			<PrivateAssets>all</PrivateAssets>
+			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+		</PackageReference>
+		<PackageReference Include="Mufiy.ResxMapGenerator.NoDependencies" Version="0.0.1-Beta8">
+			<PrivateAssets>all</PrivateAssets>
+			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+		</PackageReference>
+		<PackageReference Include="System.Resources.Extensions" Version="10.0.8" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Compile Remove="Program.cs" />
+		<Compile Remove="Form1.cs" />
+		<Compile Remove="Form1.Designer.cs" />
+		<Compile Remove="Global.cs" />
+		<Compile Include="Program.cs" />
+		<Compile Include="Form1.cs" />
+		<Compile Include="Form1.Designer.cs" />
+		<Compile Include="Global.cs" />
+	</ItemGroup>
+
+	<!-- 项目级资源：与示例项目 MufiyApp1 的 Properties\Resources.resx + Resources.Designer.cs 对齐。
+	     为什么必须同时改两处：本文件的 item 决定「新项目会编译哪些文件」，
+	     MufiyProjectTemplate.vstemplate 的 ProjectItem 决定「新建项目时生成哪些文件」，
+	     只登记一处会让文件被静默丢弃、或项目树里出现指向不存在文件的缺失项。
+	     Remove 后再 Include 与上面的 Compile 组同理：SDK 的隐式 glob 已经收集了 resx，
+	     直接 Include 会产生重复项（NETSDK1022）。
+	     Generator / LastGenOutput / DependentUpon / DesignTime / AutoGen 照抄示例项目的写法：
+	     缺了它们，VS 会把 Resources.Designer.cs 显示成与 resx 平级的普通文件，
+	     双击 resx 也不会再重新生成设计器代码。 -->
+	<ItemGroup>
+		<EmbeddedResource Remove="Properties\Resources.resx" />
+		<EmbeddedResource Include="Properties\Resources.resx">
+			<Generator>ResXFileCodeGenerator</Generator>
+			<LastGenOutput>Resources.Designer.cs</LastGenOutput>
+		</EmbeddedResource>
+	</ItemGroup>
+
+	<ItemGroup>
+		<Compile Remove="Properties\Resources.Designer.cs" />
+		<Compile Include="Properties\Resources.Designer.cs">
+			<DesignTime>True</DesignTime>
+			<AutoGen>True</AutoGen>
+			<DependentUpon>Resources.resx</DependentUpon>
+		</Compile>
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Remove="Assets\Fonts\arial.ttf" />
+		<None Remove="Assets\Fonts\MiSansVF.ttf" />
+		<None Remove="Assets\Fonts\NotoColorEmoji.ttf" />
+		<None Remove="Assets\Fonts\NotoColorEmoji_windows.ttf" />
+		<None Include="Assets\Fonts\arial.ttf">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+		<None Include="Assets\Fonts\MiSansVF.ttf">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+		<None Include="Assets\Fonts\NotoColorEmoji.ttf">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+		<None Include="Assets\Fonts\NotoColorEmoji_windows.ttf">
+			<CopyToOutputDirectory>Always</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<!-- ============================================================================
+	     NativeAOT 发布（仅在 PublishAot=true 时生效，普通 build / 调试完全不受影响）
+
+	     命令（多目标工程必须显式 -f net10.0，否则报 NETSDK1129）：
+	         dotnet publish MufiyApp1.csproj -c Release -f net10.0 -r win-x64 -p:PublishAot=true
+	         dotnet publish MufiyApp1.csproj -c Release -f net10.0 -r win-x86 -p:PublishAot=true
+	     产物：bin\Release\net10.0\<rid>\publish\（单个原生 exe + 少量原生依赖，无托管 DLL）
+	     实测：win-x64 启动 645 ms；win-x86 启动 1021 ms，都能正常出窗口。
+
+	     【TFM 必须停在 net10.0，不要写 net11.0】
+	     .NET 11 (RC1) 的 AOT 运行时会静态导入 api-ms-win-core-synch-l1-2-0.dll 的
+	     WaitOnAddress / WakeByAddressSingle（Win8 才引入），加载期全量解析失败 → Win7 直接起不来。
+	     .NET 10 的 AOT 没有这个导入。隔离实验（同一份空程序只换 TFM）确认是纯 TFM 差异，
+	     与 OptimizationPreference / InvariantGlobalization 等开关无关。详见文件顶部注释。
+
+	     【win-x86 需要额外的入口点补丁，见文件末尾那个 ItemGroup】
+	     Mufiy 窗口层 P/Invoke 了只存在于 64 位 user32.dll 的 SetWindowLongPtr，
+	     32 位进程必崩（与 AOT 无关，非 AOT 的 win-x86 一样崩；Beta9 一样崩）。
+	     由 Native/mufiy.user32.x86.dll（转发 DLL）+ Win32EntryPointShim.cs
+	     （NativeLibrary.SetDllImportResolver）绕过，只在 32 位生效、x64 零影响。
+
+	     【为什么要 root：反射构造的构造函数被裁掉】
+	     Mufiy 的主题系统在运行期用反射创建颜色表对象
+	     （Mufiy.DefaultTheme → Mufiy.MufiyThemeColorTable 的各属性 → Activator.CreateInstance）。
+	     PublishAot 隐含 TrimMode=full，裁剪器看不到「Type → 构造函数」这条边，会把它们的
+	     公有无参构造函数剪掉，运行时抛：
+	         System.MissingMethodException: No parameterless constructor defined for type
+	         'Mufiy.WindowDecorationColors'.
+	     （实测确认：该类型的 .ctor 在程序集里是 Public RTSpecialName，确系被裁剪，不是包本身缺构造函数。）
+
+	     【为什么按类型精确 root，而不是 root 整个程序集】
+	     见 AotRoots.xml（经 @(TrimmerRootDescriptor) 注入）。图省事用 @(TrimmerRootAssembly) 保留
+	     整个 Mufiy.dll 会牵出一批原本不在图里的泛型「编译器生成类型」，而 Mufiy 发布包经过混淆，
+	     其中至少一个方法体的元数据 token 是坏的，ILC 直接硬崩、连包都发不出来：
+	         Internal.TypeSystem.TypeSystemException+BadImageFormatException:
+	             The format of a DLL or executable being loaded is invalid
+	           at ILCompiler.Dataflow.CompilerGeneratedState.TypeCache..ctor(...)
+
+	     注：Mufiy 包自带的 buildTransitive/Mufiy.targets 已经处理了另一件 AOT 必做事——
+	     在 AOT/裁剪形态显式注入 Mufiy.Xaml.HotReload=false，把运行期 XAML 加载器整链判定为死代码。
+	     ============================================================================ -->
+	<ItemGroup Condition="'$(PublishAot)' == 'true'">
+		<TrimmerRootDescriptor Include="AotRoots.xml" />
+		<!-- AotRoots.xml 只是构建期输入，不需要出现在输出目录里 -->
+		<None Remove="AotRoots.xml" />
+	</ItemGroup>
+
+	<!-- ============================================================================
+	     win-x86 专用：user32 入口点补丁（只在 32 位目标下带出去）
+
+	     Mufiy 窗口层 P/Invoke 了只存在于 64 位 user32.dll 的 SetWindowLongPtr，
+	     32 位进程必崩（非 AOT 也崩）。补丁由两部分组成：
+	       · Native/mufiy.user32.x86.dll —— 纯转发 DLL，把 Ptr 系列映射到非 Ptr 版本
+	         （源文件 Native/user32.x86.def，生成命令写在文件头注释里）
+	       · Win32EntryPointShim.cs —— 用 NativeLibrary.SetDllImportResolver 把
+	         平台层程序集对 user32.dll 的解析重定向到它；x64 上是空操作
+	     本 ItemGroup 只负责把 DLL 拷到输出目录（含 publish）。
+
+	     ⚠ Mufiy 未修好「x86 走非 Ptr 分支」之前必须保留；上游修好后这一整块可删。
+	     ============================================================================ -->
+	<ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x86'">
+		<!-- 必须写 Link：否则 Mufiy 保留 Native\ 子目录，运行时按程序目录找不到 -->
+		<None Include="Native\mufiy.user32.x86.dll" Link="mufiy.user32.x86.dll">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<!-- ============================================================================
+	     发布瘦身：剔掉 NuGet 原生包自带的 PDB
+
+	     libSkiaSharp.pdb 92 MB + libHarfBuzzSharp.pdb 23 MB 会被当作原生资产一起拷进 publish，
+	     运行时完全用不到，却让发布目录从 ~20 MB 涨到 164 MB —— 拷到老机器上很累赘。
+	     （做法与仓库里 Skia4AotTest 工程一致。）
+
+	     需要调试原生崩溃时把这段删掉即可；MufiyApp1.pdb 是应用自身的符号，保留不动。
+	     ============================================================================ -->
+	<Target Name="TrimNativePdbFromPublish" AfterTargets="ComputeResolvedFilesToPublishList">
+		<ItemGroup>
+			<!-- 只剔 .pdb，且放过应用自身的 MufiyApp1.pdb（AOT 崩溃排查要用） -->
+			<ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+			                       Condition="'%(Extension)' == '.pdb' and '%(Filename)' != 'MufiyApp1'" />
+		</ItemGroup>
+	</Target>
+
+</Project>
